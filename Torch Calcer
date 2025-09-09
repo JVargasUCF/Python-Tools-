@@ -1,0 +1,483 @@
+# This notebook defines utilities to:
+# - Ingest discrete temperature points (x, r, T) for an axisymmetric torch wall
+# - Interpolate onto an (x, r) grid with inverse-distance weighting (no SciPy)
+# - Compute wall heat flux q'' at the outer wall from dT/dr and k(T)
+# - March a simple hydrogen channel cooling model along x using Dittus–Boelter
+# - Plot: (1) temperature field (r vs x), (2) wall temperature vs x, (3) wall heat flux vs x
+# 
+# The user can replace the example dataset with their own points.
+
+import numpy as np
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+from typing import Callable, Optional, Tuple, List, Dict
+# ========================== SIMPLE GUI: run_gui() ==========================
+# Requirements:
+#   pip install pandas matplotlib
+# Usage:
+#   from this_file import run_gui
+#   run_gui()
+# --------------------------------------------------------------------------
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import pandas as pd
+import numpy as np
+
+def run_gui():
+    """Small tkinter GUI to run axisymmetric wall analysis with your helpers."""
+    root = tk.Tk()
+    root.title("Torch Wall Analysis")
+
+    # ---------- Helpers ----------
+    def browse_points():
+        path = filedialog.askopenfilename(
+            title="Select temperature points CSV",
+            filetypes=[("CSV files","*.csv"), ("All files","*.*")]
+        )
+        if path:
+            points_path_var.set(path)
+
+    def browse_profile():
+        path = filedialog.askopenfilename(
+            title="Select wall profile CSV (columns: x,r_inner,r_outer)",
+            filetypes=[("CSV files","*.csv"), ("All files","*.*")]
+        )
+        if path:
+            profile_path_var.set(path)
+
+    def _float(entry, default=0.0):
+        try:
+            return float(entry.get())
+        except Exception:
+            return float(default)
+
+    def _int(entry, default=0):
+        try:
+            return int(entry.get())
+        except Exception:
+            return int(default)
+
+    def run_now():
+        try:
+            # ---- Read points ----
+            pth_pts = points_path_var.get().strip()
+            if not pth_pts:
+                messagebox.showerror("Missing", "Pick a temperature points CSV.")
+                return
+            dfp = pd.read_csv(pth_pts)
+            # Expect columns x_m, r_m, T_K (as in template)
+            for col in ("x_m","r_m","T_K"):
+                if col not in dfp.columns:
+                    messagebox.showerror("Bad CSV", f"Points CSV must include '{col}'.")
+                    return
+            pts = dfp[["x_m","r_m","T_K"]].to_numpy()
+
+            # ---- Wall profile: either CSV or auto from points (min/max r per x) ----
+            pth_prof = profile_path_var.get().strip()
+            if pth_prof:
+                dfw = pd.read_csv(pth_prof)
+                for col in ("x","r_inner","r_outer"):
+                    if col not in dfw.columns:
+                        messagebox.showerror("Bad CSV", "Profile CSV must have columns: x, r_inner, r_outer.")
+                        return
+                x = dfw["x"].to_numpy()
+                r_inner = dfw["r_inner"].to_numpy()
+                r_outer = dfw["r_outer"].to_numpy()
+            else:
+                # Derive r_inner/r_outer from the radial extent of points at each x (fast & decent)
+                groups = dfp.groupby("x_m")
+                x = groups["x_m"].first().to_numpy()
+                r_inner = groups["r_m"].min().to_numpy()
+                r_outer = groups["r_m"].max().to_numpy()
+
+            # enforce sorting
+            order = np.argsort(x)
+            x = x[order]; r_inner = r_inner[order]; r_outer = r_outer[order]
+            wall = WallProfile(x=x, r_inner=r_inner, r_outer=r_outer)
+
+            # ---- Material props ----
+            mat = Material(
+                rho=_float(ent_mat_rho, 8000.0),
+                cp=_float(ent_mat_cp, 500.0),
+                k=_float(ent_mat_k, 16.0),
+                k_of_T=None   # upgrade later if you want T-dependent k
+            )
+
+            # ---- Build temps_by_x dict (radial cuts per station) ----
+            temps_by_x = {}
+            # snap tolerance so float keys match
+            xtab = wall.x
+            for xi in xtab:
+                mask = np.isclose(pts[:,0], xi, rtol=0, atol=float(tol_snap_entry.get()))
+                r_vec = pts[mask, 1]
+                T_vec = pts[mask, 2]
+                if r_vec.size >= 2:
+                    idx = np.argsort(r_vec)
+                    temps_by_x[float(xi)] = (r_vec[idx], T_vec[idx])
+
+            if not temps_by_x:
+                messagebox.showerror("No radial cuts",
+                                     "Could not find any x-station with ≥2 radial points.\n"
+                                     "Increase the snap tolerance or include more points.")
+                return
+
+            # ---- Compute q'' and Twall ----
+            xs, q_wall, Tw = compute_wall_heat_flux_along_x(
+                temps_by_x, wall, mat, side=('outer' if side_var.get()==0 else 'inner')
+            )
+
+            # ---- GH2 cooling if requested ----
+            if gh2_enable_var.get() == 1:
+                gh2 = GH2Cooling(
+                    mdot=_float(ent_mdot, 0.005),
+                    T_in=_float(ent_Tin, 110.0),
+                    cp=_float(ent_cp, 13500.0),
+                    rho=_float(ent_rho, 8.0),
+                    mu=_float(ent_mu, 9e-6),
+                    k=_float(ent_k, 0.2),
+                    Dh=_float(ent_Dh, 1.5e-3),
+                    A_flow=_float(ent_A, 1.6e-6),
+                    perimeter=_float(ent_P, 0.02),
+                    heating=True
+                )
+                Tb, hH2, ReH2, NuH2 = march_h2_channel_temperature(xs, np.nan_to_num(q_wall, nan=0.0), gh2)
+            else:
+                Tb = None
+
+            # ---- Plots ----
+            if plot_field_var.get() == 1:
+                plot_temperature_field(pts, wall, nx=_int(ent_nx, 240), nr=_int(ent_nr, 120))
+            if plot_Twall_var.get() == 1:
+                plot_wall_series(xs, Tw, ylabel="T_wall [K]", title="Wall Temperature")
+            if plot_q_var.get() == 1:
+                plot_wall_series(xs, q_wall, ylabel="q'' [W/m²]", title="Wall Heat Flux")
+            if Tb is not None and plot_Tcool_var.get() == 1:
+                plot_wall_series(xs, Tb, ylabel="T_bulk GH2 [K]", title="Hydrogen Coolant Bulk Temperature")
+
+            # Final show (prevents the first blocking-plot problem)
+            import matplotlib.pyplot as plt
+            plt.show()
+
+            messagebox.showinfo("Done", "Analysis complete. Check plot windows.")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"{type(e).__name__}: {e}")
+
+    # ---------- Layout ----------
+    frm = ttk.Frame(root, padding=10)
+    frm.grid(row=0, column=0, sticky="nsew")
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(0, weight=1)
+
+    # Files
+    ttk.Label(frm, text="Temperature points CSV (x_m, r_m, T_K):").grid(row=0, column=0, sticky="w")
+    points_path_var = tk.StringVar()
+    ttk.Entry(frm, textvariable=points_path_var, width=48).grid(row=1, column=0, sticky="we")
+    ttk.Button(frm, text="Browse…", command=browse_points).grid(row=1, column=1)
+
+    ttk.Label(frm, text="Wall profile CSV (x, r_inner, r_outer) — optional:").grid(row=2, column=0, sticky="w", pady=(8,0))
+    profile_path_var = tk.StringVar()
+    ttk.Entry(frm, textvariable=profile_path_var, width=48).grid(row=3, column=0, sticky="we")
+    ttk.Button(frm, text="Browse…", command=browse_profile).grid(row=3, column=1)
+
+    # Snap tolerance
+    ttk.Label(frm, text="Match tolerance on x (for grouping points) [m]:").grid(row=4, column=0, sticky="w", pady=(8,0))
+    tol_snap_entry = ttk.Entry(frm, width=12)
+    tol_snap_entry.insert(0, "1e-6")
+    tol_snap_entry.grid(row=4, column=1, sticky="w")
+
+    # Material
+    ttk.Label(frm, text="Material (solid wall): ρ [kg/m³], cp [J/kg-K], k [W/m-K]").grid(row=5, column=0, sticky="w", pady=(8,0))
+    ent_mat_rho = ttk.Entry(frm, width=10); ent_mat_rho.insert(0, "8000")
+    ent_mat_cp  = ttk.Entry(frm, width=10); ent_mat_cp.insert(0,  "500")
+    ent_mat_k   = ttk.Entry(frm, width=10); ent_mat_k.insert(0,   "16")
+    ent_mat_rho.grid(row=6, column=0, sticky="w"); ent_mat_cp.place(x=190, y=217); ent_mat_k.place(x=300, y=217)
+
+    # Which wall side to compute gradient
+    side_var = tk.IntVar(value=0)  # 0 outer, 1 inner
+    ttk.Label(frm, text="Wall side for q'' & T_wall:").grid(row=7, column=0, sticky="w", pady=(8,0))
+    ttk.Radiobutton(frm, text="Outer", variable=side_var, value=0).grid(row=8, column=0, sticky="w")
+    ttk.Radiobutton(frm, text="Inner", variable=side_var, value=1).grid(row=8, column=1, sticky="w")
+
+    # GH2 cooling group
+    gh2_enable_var = tk.IntVar(value=1)
+    ttk.Checkbutton(frm, text="Enable GH₂ cooling march", variable=gh2_enable_var).grid(row=9, column=0, sticky="w", pady=(8,0))
+
+    grid2 = ttk.Frame(frm)
+    grid2.grid(row=10, column=0, columnspan=2, sticky="we")
+    for j in range(10): grid2.columnconfigure(j, weight=1)
+
+    def _lab(row, col, txt): ttk.Label(grid2, text=txt).grid(row=row, column=col, sticky="w")
+    def _ent(row, col, val, w=10):
+        e = ttk.Entry(grid2, width=w); e.insert(0, val); e.grid(row=row, column=col, sticky="w"); return e
+
+    _lab(0,0,"ṁ [kg/s]");  ent_mdot = _ent(0,1,"0.008")
+    _lab(0,2,"T_in [K]");  ent_Tin  = _ent(0,3,"100")
+    _lab(0,4,"cp [J/kg-K]"); ent_cp = _ent(0,5,"13500")
+    _lab(1,0,"ρ [kg/m³]"); ent_rho = _ent(1,1,"8.0")
+    _lab(1,2,"μ [Pa·s]");  ent_mu  = _ent(1,3,"9e-6")
+    _lab(1,4,"k_gas [W/m-K]"); ent_k = _ent(1,5,"0.2")
+    _lab(2,0,"D_h [m]");   ent_Dh   = _ent(2,1,"1.5e-3")
+    _lab(2,2,"A_flow [m²]"); ent_A  = _ent(2,3,"1.77e-6")
+    _lab(2,4,"Perimeter [m]"); ent_P = _ent(2,5,"0.02")
+
+    # Plot toggles
+    plot_field_var = tk.IntVar(value=1)
+    plot_Twall_var = tk.IntVar(value=1)
+    plot_q_var     = tk.IntVar(value=1)
+    plot_Tcool_var = tk.IntVar(value=1)
+    ttk.Label(frm, text="Plots to show:").grid(row=11, column=0, sticky="w", pady=(8,0))
+    ttk.Checkbutton(frm, text="Temperature field (x–r)", variable=plot_field_var).grid(row=12, column=0, sticky="w")
+    ttk.Checkbutton(frm, text="Wall temperature vs x", variable=plot_Twall_var).grid(row=12, column=1, sticky="w")
+    ttk.Checkbutton(frm, text="Wall heat flux vs x", variable=plot_q_var).grid(row=13, column=0, sticky="w")
+    ttk.Checkbutton(frm, text="Coolant bulk T vs x", variable=plot_Tcool_var).grid(row=13, column=1, sticky="w")
+
+    # Grid settings for field
+    ttk.Label(frm, text="Field grid: nx, nr").grid(row=14, column=0, sticky="w", pady=(8,0))
+    ent_nx = ttk.Entry(frm, width=8); ent_nx.insert(0, "240"); ent_nx.grid(row=14, column=0, sticky="w", padx=(110,0))
+    ent_nr = ttk.Entry(frm, width=8); ent_nr.insert(0, "120"); ent_nr.grid(row=14, column=1, sticky="w")
+
+    # Run button
+    ttk.Button(frm, text="Run Analysis", command=run_now).grid(row=15, column=0, pady=10, sticky="w")
+
+    root.mainloop()
+
+# Optional: allow running this file directly to launch GUI
+if __name__ == "__main__":
+    run_gui()
+
+# ----------------------------- Data structures -----------------------------
+
+@dataclass
+class WallProfile:
+    """Axisymmetric wall profile along x: inner & outer radii (m)."""
+    x: np.ndarray            # [N] axial stations, increasing
+    r_inner: np.ndarray      # [N] inner radius (m)
+    r_outer: np.ndarray      # [N] outer radius (m)
+
+@dataclass
+class GH2Cooling:
+    """Hydrogen cooling channel parameters (assumed annular or round of given Dh & perimeter)."""
+    mdot: float              # kg/s
+    T_in: float              # K (bulk at inlet x[0])
+    cp: float                # J/kg-K (can be approx constant)
+    rho: float               # kg/m^3 (bulk)
+    mu: float                # Pa·s
+    k: float                 # W/m-K (gas)
+    Dh: float                # m hydraulic diameter of channel
+    A_flow: float            # m^2 flow area
+    perimeter: float         # m wetted perimeter in contact with wall (per circumference at each x)
+    heating: bool = True     # True for heating (n=0.4), False for cooling (n=0.3) in Dittus–Boelter
+
+@dataclass
+class Material:
+    """Solid material properties. k can be a constant or a function of temperature (K)."""
+    rho: float               # kg/m^3
+    cp: float                # J/kg-K
+    k:  float                # W/m-K (use constant) 
+    # Optionally supply a function; if provided, overrides constant k:
+    k_of_T: Optional[Callable[[float], float]] = None
+
+# ----------------------------- Utilities -----------------------------
+
+def idw_interpolate(xq, rq, pts, p=2.0, eps=1e-12):
+    """
+    Inverse-distance weighting interpolation of temperature at query points (xq, rq).
+    pts: array of shape [M, 3] with columns (x, r, T).
+    Returns Tq with same shape as xq.
+    """
+    x = pts[:, 0][:, None]
+    r = pts[:, 1][:, None]
+    T = pts[:, 2][:, None]
+    Xq = xq.ravel()[None, :]
+    Rq = rq.ravel()[None, :]
+    # distance in (x, r) space (no stretching by default; user may scale if needed)
+    d2 = (x - Xq)**2 + (r - Rq)**2 + eps
+    w = 1.0 / (d2**(p/2.0))
+    Tq = (w * T).sum(axis=0) / w.sum(axis=0)
+    return Tq.reshape(xq.shape)
+
+def dittus_boelter_h(mdot, rho, mu, k, Dh, A_flow, Pr=None, heating=True):
+    """
+    Returns h [W/m^2-K], Re, Nu for internal turbulent forced convection.
+    If Pr is None, compute with cp ~ assume pinned via k, mu, rho? Here we leave None -> use 0.7 as typical H2 proxy.
+    """
+    U = mdot / (rho * max(A_flow, 1e-12))
+    Re = rho * U * Dh / max(mu, 1e-12)
+    if Pr is None:
+        Pr = 0.7  # rough value for H2 at high T (user can pass better)
+    n = 0.4 if heating else 0.3
+    Nu = 0.023 * (max(Re, 1.0)**0.8) * (max(Pr, 1e-4)**n)
+    h = Nu * k / max(Dh, 1e-12)
+    return h, Re, Nu, U
+
+def finite_diff_wall_gradient(T_r, r, side='outer'):
+    """
+    Compute dT/dr at the wall from a radial profile T(r) sampled at >=2 points near the wall.
+    side='outer' uses the last two points; side='inner' uses the first two points.
+    Returns dTdr at wall and a simple linear-extrapolated wall temperature (if needed).
+    """
+    if len(r) < 2:
+        return np.nan, np.nan
+    if side == 'outer':
+        T1, T2 = T_r[-2], T_r[-1]
+        r1, r2 = r[-2], r[-1]
+    else:
+        T1, T2 = T_r[0], T_r[1]
+        r1, r2 = r[0], r[1]
+    dTdr = (T2 - T1) / max((r2 - r1), 1e-12)
+    return dTdr, T2
+
+def compute_wall_heat_flux_along_x(temps_by_x: Dict[float, Tuple[np.ndarray, np.ndarray]],
+                                   wall: WallProfile,
+                                   mat: Material,
+                                   side='outer'):
+    """
+    temps_by_x: dict mapping x_i -> (r_vec, T_vec) radial samples in the solid at that station.
+    Returns arrays along wall.x of q'' [W/m^2] and Twall [K] at the chosen side.
+    """
+    xs = wall.x
+    q = np.full_like(xs, np.nan, dtype=float)
+    Tw = np.full_like(xs, np.nan, dtype=float)
+    kfun = (lambda T: mat.k_of_T(T)) if mat.k_of_T else (lambda T: mat.k)
+    for i, xi in enumerate(xs):
+        if xi in temps_by_x:
+            r_vec, T_vec = temps_by_x[xi]
+            dTdr, Twall_est = finite_diff_wall_gradient(T_vec, r_vec, side=side)
+            k_loc = kfun(Twall_est)
+            q[i]  = -k_loc * dTdr
+            Tw[i] = Twall_est
+    return xs, q, Tw
+
+def march_h2_channel_temperature(xs, q_wall, gh2: GH2Cooling, T0=None):
+    """
+    March GH2 bulk temperature along x using energy balance:
+      mdot*cp*dT = q'' * P * dx  => T_{i+1} = T_i + (q''_i * P * dx) / (mdot*cp)
+    Also recompute h at each step from Dittus–Boelter using updated bulk T
+    (user may substitute better property models).
+    Returns Tbulk[x], h[x], Re[x], Nu[x].
+    """
+    N = len(xs)
+    Tb = np.full(N, np.nan)
+    h  = np.full(N, np.nan)
+    Re = np.full(N, np.nan)
+    Nu = np.full(N, np.nan)
+    Tb[0] = gh2.T_in if T0 is None else T0
+    for i in range(N):
+        # update h at station i
+        hi, Rei, Nui, U = dittus_boelter_h(gh2.mdot, gh2.rho, gh2.mu, gh2.k, gh2.Dh, gh2.A_flow, heating=gh2.heating)
+        h[i], Re[i], Nu[i] = hi, Rei, Nui
+        if i < N-1 and not np.isnan(q_wall[i]):
+            dx = xs[i+1] - xs[i]
+            Tb[i+1] = Tb[i] + (q_wall[i] * gh2.perimeter * dx) / max(gh2.mdot * gh2.cp, 1e-12)
+        elif i < N-1:
+            Tb[i+1] = Tb[i]
+    return Tb, h, Re, Nu
+
+# ----------------------------- Plotting helpers -----------------------------
+
+def plot_temperature_field(pts: np.ndarray, wall: WallProfile, nx=200, nr=100):
+    """
+    Make a colored temperature field plot (r on Y, x on X). Regions outside the wall are masked.
+    pts: [M,3] array (x, r, T)
+    """
+    x_min, x_max = wall.x.min(), wall.x.max()
+    r_max = wall.r_outer.max()
+    Xg, Rg = np.meshgrid(np.linspace(x_min, x_max, nx), np.linspace(0.0, r_max, nr))
+    Tg = idw_interpolate(Xg, Rg, pts, p=2.0)
+    # Mask outside the wall (r > r_outer(x))
+    r_outer_interp = np.interp(Xg[0, :], wall.x, wall.r_outer)
+    mask = Rg > r_outer_interp[None, :]
+    Tg_masked = np.ma.array(Tg, mask=mask)
+    plt.figure(figsize=(8, 3.5))
+    cf = plt.pcolormesh(Xg, Rg, Tg_masked, shading='auto')
+    plt.colorbar(cf, label='Temperature [K]')
+    # overlay wall profile
+    plt.plot(wall.x, wall.r_outer, lw=1.5)
+    plt.plot(wall.x, wall.r_inner, lw=1.0)
+    plt.xlabel('Axial position x [m]')
+    plt.ylabel('Radius r [m]')
+    plt.title('Axisymmetric Temperature Field (IDW interpolated)')
+    plt.tight_layout()
+    plt.show()
+
+def plot_wall_series(xs, series, ylabel, title):
+    plt.figure(figsize=(8, 2.6))
+    plt.plot(xs, series)
+    plt.xlabel('Axial position x [m]')
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+# ----------------------------- Example dataset -----------------------------
+
+# Synthetic wall profile (replace these with your CAD-extracted radii)
+x = np.linspace(0.0, 0.06, 31)
+r_outer = 0.006 + 0.0005*np.exp(-((x-0.02)/0.01)**2)   # slight bulge near injector
+r_inner = r_outer - 0.0015                              # 1.5 mm wall thickness
+wall = WallProfile(x=x, r_inner=r_inner, r_outer=r_outer)
+
+# Build synthetic temperature points: hotter near x=0.02, gradient to outer wall
+rng = np.random.default_rng(3)
+pts = []
+for xi, ro, ri in zip(wall.x, wall.r_outer, wall.r_inner):
+    r_samples = np.linspace(ri, ro, 8)
+    # fake profile T(r) = Tg - A*(r - ri) with axial hot spot
+    Tg = 2200 - 800*np.exp(-((xi-0.02)/0.012)**2)
+    A = 6.0e5  # K/m gradient magnitude
+    T_profile = Tg - A*(r_samples - ri)
+    # add small noise
+    T_profile += rng.normal(0, 5, size=T_profile.size)
+    for rj, Tj in zip(r_samples, T_profile):
+        pts.append((xi, rj, Tj))
+pts = np.array(pts)
+
+# Material (stainless-like constant k)
+mat = Material(rho=8000.0, cp=500.0, k=16.0)
+
+# Compute wall heat flux q'' at outer wall (from radial profiles per x)
+temps_by_x: Dict[float, Tuple[np.ndarray, np.ndarray]] = {}
+for xi in wall.x:
+    mask = np.isclose(pts[:,0], xi)
+    r_vec = pts[mask,1]
+    T_vec = pts[mask,2]
+    # Sort by r
+    idx = np.argsort(r_vec)
+    temps_by_x[xi] = (r_vec[idx], T_vec[idx])
+
+xs, q_outer, Tw_outer = compute_wall_heat_flux_along_x(temps_by_x, wall, mat, side='outer')
+
+# Hydrogen channel assumptions (example)
+gh2 = GH2Cooling(
+    mdot=0.008, T_in=100.0, cp=13500.0, rho=8.0, mu=9e-6, k=0.2, Dh=1.5e-3,
+    A_flow=1.77e-6*np.pi, perimeter=2.0*np.pi*np.mean(wall.r_inner)
+)
+
+# March GH2 bulk temperature along x using outer-wall heat flux magnitude as "into coolant"
+Tb, hH2, ReH2, NuH2 = march_h2_channel_temperature(xs, np.nan_to_num(q_outer, nan=0.0), gh2)
+
+# ----------------------------- Plots -----------------------------
+
+# 1) Temperature field with wall overlay
+plot_temperature_field(pts, wall, nx=240, nr=120)
+
+# 2) Wall temperature vs x (outer) 
+plot_wall_series(xs, Tw_outer, ylabel='T_wall, outer [K]', title='Wall Temperature at Outer Surface')
+
+# 3) Heat flux vs x (outer) 
+plot_wall_series(xs, q_outer, ylabel="q'' outer [W/m²]", title='Outer-Surface Heat Flux (from dT/dr)')
+
+# 4) GH2 bulk temperature along channel
+plot_wall_series(xs, Tb, ylabel='T_bulk GH2 [K]', title='Hydrogen Coolant Bulk Temperature (marched)')
+
+# ----------------------------- Export a CSV template -----------------------------
+import pandas as pd
+template = pd.DataFrame({
+    'x_m': np.repeat(wall.x[:5], 5),     # 5 axial stations, 5 radial points each (example shape)
+    'r_m': np.tile(np.linspace(wall.r_inner[0], wall.r_outer[0], 5), 5),
+    'T_K': 300.0
+})
+template_path = '/mnt/data/axisymmetric_T_points_template.csv'
+template.to_csv(template_path, index=False)
+template_path
